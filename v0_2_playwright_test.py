@@ -17,7 +17,7 @@ def test_playwright():
         
         # Navigate to a simple, stable page
         print("Navigating to Amazon...")
-        page.goto("https://www.amazon.com", wait_until="networkidle")
+        page.goto("https://www.amazon.com", wait_until="domcontentloaded")
         
         # Take a full-page screenshot
         print("Capturing screenshot...")
@@ -27,7 +27,7 @@ def test_playwright():
         # Close the browser
         browser.close()
         
-        print(f"✓ Screenshot saved: {output_path}")
+        print(f"Success: Screenshot saved: {output_path}")
         print(f"  File size: {os.path.getsize(output_path) / 1024:.1f} KB")
 
 if __name__ == "__main__":

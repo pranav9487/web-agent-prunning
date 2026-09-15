@@ -1,5 +1,23 @@
+# Virtual environment & System Python install artifacts
 venv/
+Lib/
+Scripts/
+Include/
+share/
+etc/
+
+# Byte-compiled / optimized files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Environment variables & secrets
 .env
+
+# Test outputs & screenshots
 test_screenshot.png
+screenshots/
+*.png
+
+# Lock files
+requirements.lock.txt

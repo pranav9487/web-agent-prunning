@@ -1,0 +1,78 @@
+# Task Roadmap: Pruning Engine
+
+## Version 2: OpenCV Pruning Proof of Concept (Offline, Standalone)
+
+### Phase 1: Context Checks
+- [x] Confirm OpenCV and Pillow are installed and importable in the venv (`python -c "import cv2, PIL"`)
+- [x] Confirm `test_screenshot.png` from v0.2 exists and is a valid, non-corrupted image
+- [x] Collect 5–10 additional sample screenshots across different page types (search results, product page, cart) for broader testing
+- [x] Create a `pruning/` module folder to keep this logic isolated from the agent code
+
+### Phase 2: Grayscale & Thresholding
+- [x] Write a function to convert a screenshot to grayscale
+- [x] Apply binary thresholding to separate content from background
+- [x] Save the thresholded mask image to disk for visual inspection
+- [x] Tune the threshold value until background (white/solid) areas are cleanly separated from content (text/UI)
+
+### Phase 3: Contour Detection
+- [x] Run `cv2.findContours` on the thresholded image
+- [x] Filter out contours below a minimum area (to ignore noise/specks)
+- [x] Draw bounding boxes over detected contours on a copy of the original image
+- [x] Visually verify by eye that boxes correctly wrap text blocks and UI elements
+
+### Phase 4: Crop, Stitch & Measure
+- [x] Crop out background rows/columns outside detected bounding boxes
+- [x] Stitch remaining content blocks into a single dense collage using Pillow
+- [x] Build a standalone `prune(image) -> pruned_image` function with a clean input/output contract
+- [x] Measure pixel-area reduction and file-size reduction across all sample screenshots
+- [x] Log reduction percentages to a table/CSV for later benchmarking reference
+
+### Phase 5: Validation Testing
+- [x] Run `prune()` on all 5–10 sample screenshots without errors or exceptions
+- [x] Confirm average reduction falls in the 40–60% target range from the PPT
+- [x] Write unit tests for `prune()` covering edge cases (near-blank page, text-dense page)
+- [x] Document tuning parameters (threshold value, min contour area) with rationale in code comments
+
+### V2 Results Summary
+| Screenshot | Pixel Reduction | File Reduction |
+|---|---|---|
+| test_screenshot.png (Amazon) | 3.1% | 0.5% |
+| search_results.png | 22.8% | 37.1% |
+| google_homepage.png | 88.2% | 57.0% |
+| wikipedia_article.png | 76.3% | 80.0% |
+| news_page.png | 96.4% | 97.4% |
+| github_landing.png | 16.6% | 4.2% |
+
+**25/25 unit tests passed. Pipeline works end to end.**
+
+---
+
+## Version 3: Merge Pruning into the Manual Loop
+
+### Phase 1: Context Checks
+- [ ] Confirm v1.3's manual loop script runs cleanly on its own before modifying it
+- [ ] Confirm v2's `prune()` function is tested and stable in isolation
+- [ ] Map how `prune()`'s output (pruned image) will be passed into v1's loop without breaking existing logic
+- [ ] Back up the working v1 script before editing (keep it as the Phase 5 control group)
+
+### Phase 2: Pruned-Image Integration
+- [ ] Replace the raw screenshot call in v1.3's loop with `prune()`'s output
+- [ ] Confirm the loop still runs end-to-end using pruned images instead of raw ones
+- [ ] Verify Gemini still receives a valid image object/format after pruning
+
+### Phase 3: Decision Quality Comparison
+- [ ] Run the same task with raw screenshots (v1 baseline) and pruned screenshots (v3) back to back
+- [ ] Log whether the VLM's chosen actions differ between the two runs
+- [ ] Flag any cases where pruning causes the VLM to miss an element or hallucinate one
+- [ ] Record this comparison log — it's early evidence for the Phase 5 report
+
+### Phase 4: Coordinate Mapping
+- [ ] Capture each stitched block's position in the pruned image during the crop/stitch step (v2.3)
+- [ ] Build a naive dictionary mapping pruned-image coordinates back to original screenshot bounding boxes
+- [ ] Wire this mapping into the Actor step so a pruned-image click resolves to the correct real-browser click
+
+### Phase 5: Validation Testing
+- [ ] Run the full pruned-image loop on a simple task (e.g., land on a search results page)
+- [ ] Confirm clicks on the pruned image correctly land on the intended element in the real browser, at least most of the time
+- [ ] Run a regression check against the v1 control script to confirm no crashes or broken state
+- [ ] Document known failure cases of the coordinate mapping for the v6 semantic-action upgrade to address later

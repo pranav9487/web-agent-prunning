@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Playwright Action Toolset Test Page</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      min-height: 3500px;
+      background: #f8fafc;
+      color: #1e293b;
+    }
+    .panel {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 24px;
+      max-width: 600px;
+      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+      margin-bottom: 30px;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 22px;
+      color: #0f172a;
+    }
+    .row {
+      margin: 16px 0;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      font-size: 15px;
+      box-sizing: border-box;
+    }
+    button {
+      background-color: #2563eb;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #1d4ed8;
+    }
+    .status-badge {
+      display: inline-block;
+      margin-top: 8px;
+      padding: 6px 12px;
+      background: #e2e8f0;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: bold;
+    }
+    .scroll-marker {
+      margin-top: 400px;
+      padding: 16px;
+      background: #e0f2fe;
+      border-left: 4px solid #0284c7;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1>Action Toolset Test Suite Surface</h1>
+    
+    <div class="row">
+      <button id="test-button" onclick="recordClick()">Click Me</button>
+      <div id="click-counter" class="status-badge">Clicks: 0</div>
+    </div>
+
+    <form id="search-form" class="row" onsubmit="event.preventDefault(); recordSubmit();">
+      <label for="search-input">Search Input:</label>
+      <input id="search-input" type="text" placeholder="Type here..." oninput="recordInput(this.value)">
+      <div id="input-display" class="status-badge" style="margin-top: 8px;">Value: </div>
+      <div id="submit-status" class="status-badge" style="margin-top: 8px; display: block;">Form Submitted: false</div>
+    </form>
+  </div>
+
+  <div class="scroll-marker" id="marker-500" style="margin-top: 500px;">
+    Scroll Marker 1: ~500px down
+  </div>
+  <div class="scroll-marker" id="marker-1500" style="margin-top: 1000px;">
+    Scroll Marker 2: ~1500px down
+  </div>
+  <div class="scroll-marker" id="marker-2500" style="margin-top: 1000px;">
+    Scroll Marker 3: ~2500px down
+  </div>
+
+  <script>
+    let clickCount = 0;
+    let submitCount = 0;
+
+    function recordClick() {
+      clickCount++;
+      document.getElementById('click-counter').innerText = 'Clicks: ' + clickCount;
+    }
+
+    function recordInput(val) {
+      document.getElementById('input-display').innerText = 'Value: ' + val;
+    }
+
+    function recordSubmit() {
+      submitCount++;
+      const val = document.getElementById('search-input').value;
+      document.getElementById('submit-status').innerText = 'Form Submitted: true (count=' + submitCount + ', text="' + val + '")';
+    }
+  </script>
+</body>
+</html>

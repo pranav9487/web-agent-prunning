@@ -52,3 +52,5 @@ GEMINI_API_KEY=your_gemini_api_key_here
 | **Core Pruning Benchmarks** | `python v2_pruning_test.py` | Benchmarks contour detection, block stitching, and pixel reduction %. | `pruning_metrics.csv` |
 | **Browser Setup Test** | `python v0_2_playwright_test.py` | Verifies browser launcher & screenshot capture. | `test_screenshot.png` |
 | **Batch Sample Capture** | `python capture_samples.py` | Downloads sample pages (Amazon, Google, GitHub, Wikipedia). | `sample_screenshots/` |
+| **Action Toolset Tests (v4)** | `pytest tests/test_tools.py -v` | Comprehensive unit test suite for Playwright LangChain tools. | Terminal Test Report |
+| **Action Toolset Smoke Test** | `python smoke_test_tools.py` | Visible and live site smoke test for all action tools. | Terminal Smoke Report |

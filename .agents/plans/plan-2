@@ -93,3 +93,69 @@
 4. Horizontal coordinate shift possible in merged blocks
 5. Content-dense pages see <5% benefit
 6. See `v3_known_failures.py` for full documentation
+
+---
+
+## Version 4: Pruning Engine V2 Rewrite (Projection-Profile Approach)
+
+### Phase 1: Background Detection (F1)
+- [x] Estimate background color from image border pixels (mode of grayscale values)
+- [x] Works for light themes (white/gray bg) AND dark themes (black/dark bg)
+- [x] No hardcoded white assumption — detects any background color
+- [x] Verified: white bg detected >200, dark bg detected <60
+
+### Phase 2: Content Mask (F2)
+- [x] Build content mask via abs-difference from estimated background
+- [x] Configurable tolerance (BG_TOLERANCE=15, range 12-20)
+- [x] Works for both light and dark themes
+- [x] Verified: 100% content detection on synthetic light and dark images
+
+### Phase 3: Projection Profiles (F3)
+- [x] Compute row projection profile (content pixels per row)
+- [x] Compute column projection profile (content pixels per column)
+- [x] Used for whitespace detection instead of contour bounding boxes
+- [x] Verified: correctly identifies empty/content rows and columns
+
+### Phase 4: Whitespace Collapse (F4)
+- [x] Find empty runs (consecutive rows/cols with zero content pixels)
+- [x] Collapse runs longer than MIN_GAP (24px) down to GAP_KEEP (8px)
+- [x] Preserve short gaps (<MIN_GAP) entirely — no content loss
+- [x] Apply both horizontally and vertically
+- [x] Verified: 200px test image collapses to 126px, all content preserved
+
+### Phase 5: Coordinate Map (F5)
+- [x] Return CoordinateMap alongside pruned image
+- [x] Segment-based mapping: list of (pruned_start, original_start, length) per axis
+- [x] Helper functions: pruned_to_original(x, y) and original_to_pruned(x, y)
+- [x] Verified: round-trip error <=1px on 20 random content pixels
+
+### Phase 6: Sample Capture (F6)
+- [x] Capture 4 real screenshots via Playwright: wikipedia, amazon, github dark, dense text
+- [x] Samples stored in samples/ directory
+- [x] Verified: all 4 screenshots captured successfully
+
+### Phase 7: Retention Tests (F7)
+- [x] 36/36 tests pass (1 OCR test skipped — pytesseract not installed)
+- [x] Ink retention >= 98% on all test images (actual: 100% across all)
+- [x] Coordinate round-trip <=1px on 20 random content pixels
+- [x] Dark mode pruning works (25.4% area reduction on GitHub dark theme)
+- [x] Results table printed for all sample images
+
+### Phase 8: Known Failures Update (F8)
+- [x] FC-01 (horizontal shift): FIXED — no block collage, layout preserved
+- [x] FC-02 (dark mode): FIXED — border-mode background detection
+- [x] FC-03 (small elements): FIXED — no contour filtering
+- [x] FC-04 (spatial context): FIXED — whitespace collapse preserves layout
+- [x] FC-05 (out-of-bounds coords): FIXED — continuous segment mapping
+- [x] FC-06 (dense pages): EXPECTED LIMIT — inherent, not a bug
+
+### V4 Results Summary
+| Screenshot | Area Reduction | Size Reduction | Ink Retention |
+|---|---|---|---|
+| amazon_page.png | 0.0% | -0.7% | 100.0% |
+| dark_mode_page.png | 25.4% | 0.6% | 100.0% |
+| dense_text.png | 12.6% | -6.5% | 100.0% |
+| wikipedia_light.png | 12.6% | 4.3% | 100.0% |
+
+**36/36 tests passed. 5/6 known failures fixed. Ink retention 100% across all samples.**
+**Key improvement: Dark mode now works (was 0% before, now 25.4% reduction).**

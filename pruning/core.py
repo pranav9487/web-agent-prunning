@@ -523,6 +523,7 @@ def prune(
         "ink_retention_pct": round(ink_retention, 2),
         "original_ink_pixels": original_ink_count,
         "pruned_ink_pixels": pruned_ink_count,
+        "num_content_blocks": len(row_segments),
     }
 
     # Save debug images if requested

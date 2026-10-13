@@ -63,7 +63,11 @@ def main():
     print(f"  Raw Screenshot:        {raw_output} ({metrics['original_dimensions']} px, {raw_size/1024:.1f} KB)")
     print(f"  Pruned Screenshot:     {pruned_output} ({metrics['pruned_dimensions']} px, {pruned_size/1024:.1f} KB)")
     print(f"  Pixel Reduction:       {metrics['pixel_reduction_pct']:.1f}%")
-    print(f"  Content Blocks Found:  {metrics['num_content_blocks']}")
+    if "ink_retention_pct" in metrics:
+        print(f"  Ink Retention:         {metrics['ink_retention_pct']:.1f}%")
+    content_blocks = metrics.get("num_content_blocks")
+    if content_blocks is not None:
+        print(f"  Content Blocks Found:  {content_blocks}")
     print("=" * 60)
 
 if __name__ == "__main__":

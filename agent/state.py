@@ -20,7 +20,8 @@ from typing import TypedDict, Optional, Any
 class AgentState(TypedDict):
     """Full state passed between LangGraph nodes each step.
 
-    Observer writes: current_url, latest_pruned_image, coord_map, metrics (appended)
+    Observer writes: current_url, latest_pruned_image, coord_map,
+                     pruning_mode, element_map (Phase E), metrics (appended)
     Brain    writes: chat_history (appended), last_action_result (pending tool call)
     Actor    writes: last_action_result, step_count (incremented), done
     """
@@ -32,7 +33,14 @@ class AgentState(TypedDict):
     # Browser state — updated by Observer each step
     current_url: str
     latest_pruned_image: Optional[Any]   # PIL Image from prune()
-    coord_map: Optional[Any]             # CoordinateMap from prune()
+    coord_map: Optional[Any]             # CoordinateMap or RepackMap from prune()
+
+    # Pruning control — set at invocation, read by Observer each step
+    pruning_mode: str                    # "compress" | "repack" | "legacy"
+    count_tokens_enabled: bool           # If True, measure tokens per step
+
+    # DOM element map — updated by Observer each step (Phase E / v5)
+    element_map: Optional[list]          # list of {id, tag, text, orig_box, pruned_box}
 
     # Conversation — appended by Brain each step
     chat_history: list                   # list of LangChain BaseMessage objects

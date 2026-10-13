@@ -33,12 +33,21 @@ def main():
     pruned_output = "pruned_screenshot.png"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport=VIEWPORT)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            viewport=VIEWPORT,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
         page = context.new_page()
 
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(1000)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(1500)
+        except Exception as e:
+            print(f"  [WARN] Navigation notice ({e}), proceeding with available page...")
 
         print("\n" + "=" * 60)
         print(f"STEP 2: Capturing raw screenshot...")
@@ -63,7 +72,7 @@ def main():
     print(f"  Raw Screenshot:        {raw_output} ({metrics['original_dimensions']} px, {raw_size/1024:.1f} KB)")
     print(f"  Pruned Screenshot:     {pruned_output} ({metrics['pruned_dimensions']} px, {pruned_size/1024:.1f} KB)")
     print(f"  Pixel Reduction:       {metrics['pixel_reduction_pct']:.1f}%")
-    print(f"  Content Blocks Found:  {metrics['num_content_blocks']}")
+    print(f"  Content Blocks / Segments: {metrics.get('num_content_blocks', 0)}")
     print("=" * 60)
 
 if __name__ == "__main__":

@@ -25,7 +25,8 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from tools.browser import BrowserSession
 from tools.actions import ALL_TOOLS, translate_coords, click_element, type_text, press_key, scroll, wait_for_page_load
-from pruning import prune
+from tools.dom_extractor import build_element_map, format_element_list_for_prompt
+from pruning import prune, prune_image
 
 load_dotenv()
 
@@ -43,18 +44,48 @@ Your job:
 3. Call EXACTLY ONE tool per response, or return {"done": true} if the goal is complete.
 
 Available tools:
-- click_element(x, y): click a visible element at pruned-image coordinates
-- type_text(text, x, y): type text into an input field (clicks it first)
+- click_element(selector_or_id, x, y): click a visible element. When interactive elements with IDs (#N) are listed, prefer selector_or_id='#N'. Coordinates (x, y) are fallback.
+- type_text(text, selector_or_id, x, y): type text into an input field (focused via selector_or_id='#N' or coords).
 - press_key(key): press a keyboard key like 'Enter', 'Tab', 'Escape'
 - scroll(direction, amount): scroll 'up' or 'down' by pixel amount
 - wait_for_page_load(timeout_ms, state): wait for page to finish loading
 
 Rules:
-- Coordinates MUST be within the pruned screenshot dimensions.
-- Never guess coordinates — only click elements you can see in the image.
+- When interactive elements with IDs (#N) are listed in the prompt, prefer calling click_element(selector_or_id='#N') or type_text(text, selector_or_id='#N').
+- Coordinates MUST be within the pruned screenshot dimensions when using (x, y) fallback.
+- Never guess coordinates — only click elements you can see in the image or list.
 - After typing in a search box, press Enter to submit.
 - When the goal is fully achieved, return JSON: {"done": true, "reason": "..."}
 """
+
+def dismiss_popups(page: Any) -> bool:
+    """Detect and dismiss common cookie banners or modal popups."""
+    if not page:
+        return False
+    popup_button_selectors = [
+        'button:has-text("Accept all")',
+        'button:has-text("Accept All")',
+        'button:has-text("Accept cookies")',
+        'button:has-text("Accept Cookies")',
+        'button:has-text("I agree")',
+        'button:has-text("Agree")',
+        'button:has-text("Allow all")',
+        'button:has-text("Got it")',
+        '#onetrust-accept-btn-handler',
+        '[aria-label="Accept cookies"]',
+        '[aria-label="Close dialog"]',
+        'button[aria-label="Close"]',
+    ]
+    for sel in popup_button_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=200):
+                loc.click()
+                page.wait_for_timeout(300)
+                return True
+        except Exception:
+            continue
+    return False
 
 TOOL_MAP = {
     "click_element": click_element,
@@ -74,10 +105,10 @@ def _pil_to_base64(image: Any) -> str:
 
 
 def observer_node(state: dict) -> dict:
-    """Observer node: screenshot → prune → update state.
+    """Observer node: screenshot -> prune -> update state.
 
-    Reads:  BrowserSession (active page)
-    Writes: current_url, latest_pruned_image, coord_map, metrics (append)
+    Reads:  BrowserSession (active page), state["pruning_mode"], state["count_tokens_enabled"]
+    Writes: current_url, latest_pruned_image, coord_map, pruning_mode, metrics (append)
     """
     step_start = time.time()
 
@@ -90,6 +121,47 @@ def observer_node(state: dict) -> dict:
             "done": True,
         }
 
+    # Determine pruning mode (default: compress)
+    pruning_mode = state.get("pruning_mode", "compress")
+
+    # Build token counting function if enabled in state
+    count_tokens_fn = None
+    if state.get("count_tokens_enabled", False):
+        try:
+            _llm_for_tokens = ChatGoogleGenerativeAI(
+                model=GEMINI_MODEL,
+                google_api_key=os.getenv("GEMINI_API_KEY"),
+                temperature=0,
+            )
+
+            def count_tokens_fn(pil_img):  # noqa: F811
+                import base64
+                from io import BytesIO
+                buf = BytesIO()
+                pil_img.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                try:
+                    result = _llm_for_tokens.get_num_tokens_from_messages([
+                        {"role": "user", "content": [
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                        ]}
+                    ])
+                    return result
+                except Exception:
+                    # Fallback: estimate from pixel count (Gemini tile billing)
+                    w, h = pil_img.size
+                    tiles = ((w + 255) // 256) * ((h + 255) // 256)
+                    return max(258, tiles * 258)
+        except Exception:
+            count_tokens_fn = None
+
+    # Dismiss common cookie banners or popups before capturing
+    try:
+        dismiss_popups(page)
+    except Exception:
+        pass
+
     # Capture screenshot to a temp file
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         screenshot_path = tmp.name
@@ -100,22 +172,42 @@ def observer_node(state: dict) -> dict:
     with tempfile.NamedTemporaryFile(suffix="_pruned.png", delete=False) as tmp_pruned:
         pruned_path = tmp_pruned.name
 
-    prune_result = prune(screenshot_path, output_path=pruned_path)
+    prune_result = prune_image(
+        screenshot_path,
+        output_path=pruned_path,
+        mode=pruning_mode,
+        count_tokens_fn=count_tokens_fn,
+    )
 
     pruned_image = prune_result["pruned_image"]
     coord_map = prune_result["coord_map"]
     prune_metrics = prune_result.get("metrics", {})
+
+    # Extract DOM elements and assign IDs (Phase E / v2D)
+    element_map = []
+    try:
+        element_map = build_element_map(page, coord_map)
+    except Exception:
+        element_map = []
 
     latency = time.time() - step_start
     step_metrics = {
         "step": state.get("step_count", 0),
         "node": "observer",
         "latency_s": round(latency, 3),
+        "pruning_mode": pruning_mode,
         "original_dims": prune_metrics.get("original_dimensions", ""),
         "pruned_dims": prune_metrics.get("pruned_dimensions", ""),
         "pixel_reduction_pct": prune_metrics.get("pixel_reduction_pct", 0.0),
+        "file_reduction_pct": prune_metrics.get("file_reduction_pct", 0.0),
+        "element_count": len(element_map),
         "url": current_url,
     }
+    # Add token metrics if available
+    if "raw_tokens" in prune_metrics:
+        step_metrics["raw_tokens"] = prune_metrics["raw_tokens"]
+        step_metrics["pruned_tokens"] = prune_metrics["pruned_tokens"]
+        step_metrics["token_reduction_pct"] = prune_metrics.get("token_reduction_pct", 0.0)
 
     # Cleanup temp screenshot (keep pruned for debug)
     try:
@@ -128,6 +220,8 @@ def observer_node(state: dict) -> dict:
         "current_url": current_url,
         "latest_pruned_image": pruned_image,
         "coord_map": coord_map,
+        "pruning_mode": pruning_mode,
+        "element_map": element_map,
         "metrics": state.get("metrics", []) + [step_metrics],
     }
 
@@ -157,6 +251,12 @@ def brain_node(state: dict) -> dict:
     last_result = state.get("last_action_result", "")
     step_count = state.get("step_count", 0)
     user_goal = state.get("user_goal", "")
+    element_map = state.get("element_map") or []
+
+    element_text = ""
+    if element_map:
+        formatted_elements = format_element_list_for_prompt(element_map, max_elements=25)
+        element_text = f"\n\nInteractive elements on page:\n{formatted_elements}\n(Prefer calling click_element(selector_or_id='#N') or type_text(text, selector_or_id='#N') to target these)"
 
     user_content = [
         {
@@ -166,7 +266,8 @@ def brain_node(state: dict) -> dict:
                 f"Step: {step_count}\n"
                 f"Current URL: {state.get('current_url', '')}\n"
                 f"Last action result: {last_result if last_result else 'None (first step)'}\n"
-                f"Pruned image size: {img_width}x{img_height} px\n\n"
+                f"Pruned image size: {img_width}x{img_height} px"
+                f"{element_text}\n\n"
                 "Decide the next action. Call exactly one tool, or return JSON {\"done\": true, \"reason\": \"...\"} if the goal is complete."
             ),
         },
@@ -252,15 +353,24 @@ def brain_node(state: dict) -> dict:
             tc = tool_calls[0]
             pending_tool = {"name": tc["name"], "args": tc["args"]}
         else:
-            # Try to parse done signal from text content
+            # Try to parse done signal or direct actions from text content
             content = response.content or ""
             try:
                 parsed = json.loads(content)
                 if parsed.get("done"):
                     done = True
+                elif "click" in parsed:
+                    pending_tool = {"name": "click_element", "args": {"selector_or_id": str(parsed["click"])}}
             except (json.JSONDecodeError, AttributeError):
-                # No valid JSON — treat as unclear, keep going
-                pending_tool = None
+                import re
+                click_match = re.search(r'\bclick\s+(?:element\s+)?#?(\d+)\b', content, re.IGNORECASE)
+                type_match = re.search(r'\btype\s+["\']([^"\']+)["\']\s+(?:in|into)\s+#?(\d+)\b', content, re.IGNORECASE)
+                if click_match:
+                    pending_tool = {"name": "click_element", "args": {"selector_or_id": f"#{click_match.group(1)}"}}
+                elif type_match:
+                    pending_tool = {"name": "type_text", "args": {"text": type_match.group(1), "selector_or_id": f"#{type_match.group(2)}"}}
+                else:
+                    pending_tool = None
 
     except Exception as e:
         latency = time.time() - call_start
@@ -299,13 +409,14 @@ def brain_node(state: dict) -> dict:
 def actor_node(state: dict) -> dict:
     """Actor node: translate coords → execute v4 tool → record result.
 
-    Reads:  _pending_tool_call, coord_map
+    Reads:  _pending_tool_call, coord_map, element_map
     Writes: last_action_result, step_count (incremented), clears _pending_tool_call
     """
     step_start = time.time()
     step_count = state.get("step_count", 0)
     pending = state.get("_pending_tool_call")
     coord_map = state.get("coord_map")
+    element_map = state.get("element_map")
 
     if not pending:
         return {
@@ -318,9 +429,12 @@ def actor_node(state: dict) -> dict:
     tool_name = pending.get("name", "")
     args = dict(pending.get("args", {}))
 
-    # Inject coord_map into click and type_text so coordinate translation happens
-    if tool_name in ("click_element", "type_text") and coord_map is not None:
-        args["coord_map"] = coord_map
+    # Inject coord_map and element_map into click and type_text
+    if tool_name in ("click_element", "type_text"):
+        if coord_map is not None:
+            args["coord_map"] = coord_map
+        if element_map is not None:
+            args["element_map"] = element_map
 
     tool_fn = TOOL_MAP.get(tool_name)
     if tool_fn is None:
@@ -339,12 +453,14 @@ def actor_node(state: dict) -> dict:
         pass
 
     latency = time.time() - step_start
+    is_success = not ("failed" in str(result).lower() or "error" in str(result).lower())
     step_metrics = {
         "step": step_count,
         "node": "actor",
         "tool": tool_name,
-        "args": {k: v for k, v in args.items() if k != "coord_map"},
+        "args": {k: v for k, v in args.items() if k not in ("coord_map", "element_map")},
         "result": result,
+        "success": is_success,
         "latency_s": round(latency, 3),
     }
 

@@ -365,6 +365,7 @@ class TestPrune:
         assert "pixel_reduction_pct" in m
         assert "file_reduction_pct" in m
         assert "ink_retention_pct" in m
+        assert "num_content_blocks" in m
         assert m["original_pixels"] > 0
         assert m["pruned_pixels"] > 0
 

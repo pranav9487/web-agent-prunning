@@ -94,69 +94,155 @@ def translate_coords(
     return (x, y)
 
 
+def _find_element_in_map(selector_or_id: Any, element_map: Optional[list[dict]]) -> Optional[dict]:
+    """Find element by ID in element_map (#1, 1, etc.)."""
+    if not element_map or selector_or_id is None:
+        return None
+    s = str(selector_or_id).strip()
+    target_id = s.lstrip("#")
+    for el in element_map:
+        if str(el.get("id")) == target_id:
+            return el
+    return None
+
+
 @tool
 def click_element(
-    x: int,
-    y: int,
+    selector_or_id: Optional[Union[str, int]] = None,
+    x: Optional[int] = None,
+    y: Optional[int] = None,
     coord_map: Optional[Any] = None,
+    element_map: Optional[list[dict]] = None,
 ) -> str:
-    """Click on a web page at specific pixel coordinates (x, y).
+    """Click on a web page element by selector/ID or pixel coordinates (x, y).
 
-    If coord_map is provided from an image pruning step, coordinates are
-    automatically translated to the original page coordinates before clicking.
+    Accepts a selector or element ID (#N) first. If not provided or not found,
+    falls back to pixel coordinates (x, y) with automatic coordinate translation.
 
     Args:
-        x: Horizontal pixel coordinate to click.
-        y: Vertical pixel coordinate to click.
-        coord_map: Optional coordinate mapping dictionary or CoordinateMap from image pruning.
+        selector_or_id: Optional CSS selector or element ID (e.g. '#1', 'button.submit').
+        x: Optional horizontal pixel coordinate to click.
+        y: Optional vertical pixel coordinate to click.
+        coord_map: Optional coordinate mapping dictionary or CoordinateMap.
+        element_map: Optional list of DOM elements from dom_extractor.
 
     Returns:
         Status message confirming the click or describing the failure.
     """
+    # Backwards compatibility: handle positional call click_element(100, 200)
+    if isinstance(selector_or_id, int) and x is not None and y is None:
+        y = x
+        x = selector_or_id
+        selector_or_id = None
+
     try:
         page = BrowserSession.get_active_page()
     except RuntimeError as e:
         return f"Click failed: {e}"
 
-    try:
-        orig_x, orig_y = translate_coords(x, y, coord_map)
-        if x < 0 or y < 0 or orig_x < 0 or orig_y < 0:
-            return f"Click failed: Invalid negative coordinates ({orig_x}, {orig_y})"
-        page.mouse.click(orig_x, orig_y)
-        if (orig_x, orig_y) != (x, y):
-            return f"Clicked at ({orig_x}, {orig_y}) [translated from pruned ({x}, {y})]"
-        return f"Clicked at ({orig_x}, {orig_y})"
-    except Exception as e:
-        return f"Click failed at ({x}, {y}): {e}"
+    # 1. Try DOM element map (#N lookup)
+    if selector_or_id is not None:
+        el = _find_element_in_map(selector_or_id, element_map)
+        if el is not None:
+            box = el.get("original_box", [0, 0, 0, 0])
+            cx = box[0] + box[2] // 2
+            cy = box[1] + box[3] // 2
+            try:
+                page.mouse.click(cx, cy)
+                eid = el.get("id")
+                tag = el.get("tag", "element")
+                text = el.get("text", "")[:30]
+                return f"Clicked #{eid} <{tag}> '{text}' at ({cx}, {cy})"
+            except Exception as e:
+                return f"Click failed for element #{selector_or_id} at ({cx}, {cy}): {e}"
+
+        # 2. Try as CSS / text selector
+        try:
+            sel_str = str(selector_or_id)
+            loc = page.locator(sel_str).first
+            if loc.count() > 0:
+                loc.click(timeout=3000)
+                return f"Clicked selector '{sel_str}'"
+        except Exception:
+            pass
+
+    # 3. Fallback to pixel coordinates
+    if x is not None and y is not None:
+        try:
+            orig_x, orig_y = translate_coords(x, y, coord_map)
+            if x < 0 or y < 0 or orig_x < 0 or orig_y < 0:
+                return f"Click failed: Invalid negative coordinates ({orig_x}, {orig_y})"
+            page.mouse.click(orig_x, orig_y)
+            if (orig_x, orig_y) != (x, y):
+                return f"Clicked at ({orig_x}, {orig_y}) [translated from pruned ({x}, {y})]"
+            return f"Clicked at ({orig_x}, {orig_y})"
+        except Exception as e:
+            return f"Click failed at ({x}, {y}): {e}"
+
+    return f"Click failed: Neither valid selector/ID ('{selector_or_id}') nor coordinates ({x}, {y}) provided"
 
 
 @tool
 def type_text(
     text: str,
+    selector_or_id: Optional[Union[str, int]] = None,
     x: Optional[int] = None,
     y: Optional[int] = None,
     coord_map: Optional[Any] = None,
+    element_map: Optional[list[dict]] = None,
 ) -> str:
     """Type text into an input field on the page.
 
-    Optionally clicks the target coordinates (x, y) first to focus the input element.
-    If coord_map is provided, (x, y) are translated to original coordinates.
+    Accepts a selector or element ID (#N) first to focus the element.
+    If not provided or not found, falls back to pixel coordinates (x, y) with
+    automatic coordinate translation.
 
     Args:
         text: The string to type into the element.
+        selector_or_id: Optional CSS selector or element ID (e.g. '#1', 'input[type=text]').
         x: Optional horizontal pixel coordinate of input field to click before typing.
         y: Optional vertical pixel coordinate of input field to click before typing.
         coord_map: Optional coordinate mapping dictionary from image pruning.
+        element_map: Optional list of DOM elements from dom_extractor.
 
     Returns:
         Status message confirming text entry or describing the failure.
     """
+    # Backwards compatibility: handle positional call type_text("foo", 100, 200)
+    if isinstance(selector_or_id, int) and x is not None and y is None:
+        y = x
+        x = selector_or_id
+        selector_or_id = None
+
     try:
         page = BrowserSession.get_active_page()
     except RuntimeError as e:
         return f"Type text failed: {e}"
 
     try:
+        # 1. Try DOM element map (#N lookup)
+        if selector_or_id is not None:
+            el = _find_element_in_map(selector_or_id, element_map)
+            if el is not None:
+                box = el.get("original_box", [0, 0, 0, 0])
+                cx = box[0] + box[2] // 2
+                cy = box[1] + box[3] // 2
+                page.mouse.click(cx, cy)
+                page.keyboard.type(text)
+                eid = el.get("id")
+                return f"Typed '{text}' into #{eid} at ({cx}, {cy})"
+
+            # 2. Try as CSS selector
+            try:
+                sel_str = str(selector_or_id)
+                loc = page.locator(sel_str).first
+                if loc.count() > 0:
+                    loc.fill(text, timeout=3000)
+                    return f"Typed '{text}' into selector '{sel_str}'"
+            except Exception:
+                pass
+
+        # 3. Fallback to pixel coordinates
         if x is not None and y is not None:
             orig_x, orig_y = translate_coords(x, y, coord_map)
             if x < 0 or y < 0 or orig_x < 0 or orig_y < 0:
@@ -170,7 +256,7 @@ def type_text(
             page.keyboard.type(text)
             return f"Typed '{text}'"
     except Exception as e:
-        loc = f" at ({x}, {y})" if (x is not None and y is not None) else ""
+        loc = f" (target: {selector_or_id or (x, y)})"
         return f"Type text failed{loc}: {e}"
 
 

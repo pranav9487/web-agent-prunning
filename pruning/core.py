@@ -27,7 +27,7 @@ Tuning parameters:
 import cv2
 import numpy as np
 from PIL import Image
-from typing import Optional, NamedTuple
+from typing import Optional, NamedTuple, Callable
 import os
 import csv
 import datetime
@@ -37,7 +37,9 @@ import datetime
 BG_TOLERANCE = 15       # abs-diff from background to count as content
 MIN_GAP = 24            # empty run must be this long to collapse
 GAP_KEEP = 8            # collapsed gap is kept at this many pixels
+MIN_BLOCK_AREA = 500    # minimum pixel area to keep a block in repack mode
 # ────────────────────────────────────────────────────────────────────────────
+
 
 
 class Segment(NamedTuple):
@@ -398,58 +400,287 @@ def draw_debug_boxes(
     return debug_img
 
 
-# ── Main Prune Function ────────────────────────────────────────────────────
+# ── Repack Helpers ──────────────────────────────────────────────────────────
+
+def _find_content_blocks(
+    mask: np.ndarray,
+    min_gap: int = MIN_GAP,
+) -> list[tuple[int, int, int, int]]:
+    """Find rectangular content blocks via XY-cut on the content mask.
+
+    Uses the row and column projection profiles to split the mask into
+    independent rectangular regions, each representing a visual block.
+
+    Args:
+        mask: Binary content mask (255 = content, 0 = background).
+        min_gap: Minimum gap size to cut on.
+
+    Returns:
+        List of (x, y, w, h) bounding boxes in original image coordinates.
+    """
+    row_profile, col_profile = compute_projection_profiles(mask)
+
+    # Find row bands with content
+    def _find_content_bands(profile: np.ndarray, min_gap: int) -> list[tuple[int, int]]:
+        """Return list of (start, end) for content runs."""
+        bands = []
+        in_content = False
+        gap_count = 0
+        start = 0
+        n = len(profile)
+        for i in range(n):
+            if profile[i] > 0:
+                if not in_content:
+                    in_content = True
+                    start = max(0, i - gap_count)
+                gap_count = 0
+            else:
+                if in_content:
+                    gap_count += 1
+                    if gap_count >= min_gap:
+                        bands.append((start, i - gap_count + 1))
+                        in_content = False
+                        gap_count = 0
+        if in_content:
+            bands.append((start, n))
+        return bands
+
+    row_bands = _find_content_bands(row_profile, min_gap)
+    if not row_bands:
+        return []
+
+    h, w = mask.shape[:2]
+    blocks = []
+    for (r_start, r_end) in row_bands:
+        row_mask = mask[r_start:r_end, :]
+        _, col_prof = compute_projection_profiles(row_mask)
+        col_bands = _find_content_bands(col_prof, min_gap)
+        if not col_bands:
+            col_bands = [(0, w)]
+        for (c_start, c_end) in col_bands:
+            bw = c_end - c_start
+            bh = r_end - r_start
+            if bw * bh >= MIN_BLOCK_AREA:
+                blocks.append((c_start, r_start, bw, bh))
+
+    return blocks
+
+
+class RepackMap:
+    """Per-block coordinate mapping for repack mode.
+
+    Stores a list of (original_box, pruned_box) entries where each entry
+    maps a source rectangle in the original image to its destination
+    rectangle in the repacked collage.
+    """
+
+    def __init__(self, entries: list[dict]):
+        # Each entry: {"orig_x", "orig_y", "orig_w", "orig_h",
+        #              "pruned_x", "pruned_y", "pruned_w", "pruned_h"}
+        self.entries = entries
+
+    def pruned_to_original(self, x: int, y: int) -> tuple[int, int]:
+        """Map a point from the repacked image back to original coordinates."""
+        for e in self.entries:
+            px, py, pw, ph = e["pruned_x"], e["pruned_y"], e["pruned_w"], e["pruned_h"]
+            if px <= x < px + pw and py <= y < py + ph:
+                ox = e["orig_x"] + (x - px)
+                oy = e["orig_y"] + (y - py)
+                return (ox, oy)
+        return (x, y)
+
+    def original_to_pruned(self, x: int, y: int) -> tuple[int, int]:
+        """Map a point from original coordinates to the repacked image."""
+        for e in self.entries:
+            ox, oy, ow, oh = e["orig_x"], e["orig_y"], e["orig_w"], e["orig_h"]
+            if ox <= x < ox + ow and oy <= y < oy + oh:
+                px = e["pruned_x"] + (x - ox)
+                py = e["pruned_y"] + (y - oy)
+                return (px, py)
+        return (x, y)
+
+    def to_dict(self) -> dict:
+        """Serialize the repack map to a plain dict."""
+        return {"entries": self.entries}
+
+
+def _prune_repack(
+    image: np.ndarray,
+    content_mask: np.ndarray,
+    min_gap: int = MIN_GAP,
+    gap_keep: int = GAP_KEEP,
+    margin: int = 4,
+) -> tuple[np.ndarray, RepackMap]:
+    """Repack content blocks into a vertical collage (Mode B).
+
+    Extracts each detected content block and stacks them vertically
+    with a small margin, producing the most compact possible image.
+
+    Args:
+        image: Original BGR image.
+        content_mask: Binary content mask.
+        min_gap: Minimum gap to cut blocks on.
+        gap_keep: Not used in repack (kept for API symmetry).
+        margin: Pixel gap between blocks in the collage.
+
+    Returns:
+        Tuple of (repacked_image, RepackMap).
+    """
+    blocks = _find_content_blocks(content_mask, min_gap)
+    h_orig, w_orig = image.shape[:2]
+
+    if not blocks:
+        # Fall back to full image
+        dummy_entry = {
+            "orig_x": 0, "orig_y": 0, "orig_w": w_orig, "orig_h": h_orig,
+            "pruned_x": 0, "pruned_y": 0, "pruned_w": w_orig, "pruned_h": h_orig,
+        }
+        return image.copy(), RepackMap([dummy_entry])
+
+    # Sort blocks top-to-bottom, then left-to-right
+    blocks_sorted = sorted(blocks, key=lambda b: (b[1], b[0]))
+
+    # Determine collage width = max block width
+    collage_w = max(bw for _, _, bw, _ in blocks_sorted)
+    total_h = sum(bh for _, _, _, bh in blocks_sorted) + margin * (len(blocks_sorted) - 1)
+
+    if len(image.shape) == 3:
+        collage = np.zeros((total_h, collage_w, image.shape[2]), dtype=image.dtype)
+    else:
+        collage = np.zeros((total_h, collage_w), dtype=image.dtype)
+
+    entries = []
+    cur_y = 0
+    for (bx, by, bw, bh) in blocks_sorted:
+        src = image[by:by + bh, bx:bx + bw]
+        collage[cur_y:cur_y + bh, 0:bw] = src
+        entries.append({
+            "orig_x": bx, "orig_y": by, "orig_w": bw, "orig_h": bh,
+            "pruned_x": 0, "pruned_y": cur_y, "pruned_w": bw, "pruned_h": bh,
+        })
+        cur_y += bh + margin
+
+    return collage, RepackMap(entries)
+
+
+# ── Legacy Prune (old global row/column crop method) ──────────────────────
+
+def _prune_legacy(
+    image: np.ndarray,
+    tolerance: int = 240,
+) -> tuple[np.ndarray, None]:
+    """Legacy pruning method: global grayscale threshold + row/column crop.
+
+    This is the original method kept as a baseline. It crops blank rows and
+    columns using a fixed grayscale threshold (assumes light background).
+    Returns (pruned_image, None) — no coordinate map is produced.
+
+    Args:
+        image: BGR image.
+        tolerance: Grayscale value above which a pixel is considered blank.
+
+    Returns:
+        Tuple of (pruned_bgr_array, None).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Rows and columns with any content pixel (< tolerance)
+    content_rows = np.any(gray < tolerance, axis=1)
+    content_cols = np.any(gray < tolerance, axis=0)
+
+    rows = np.where(content_rows)[0]
+    cols = np.where(content_cols)[0]
+
+    if len(rows) == 0 or len(cols) == 0:
+        return image.copy(), None
+
+    r_start, r_end = rows[0], rows[-1] + 1
+    c_start, c_end = cols[0], cols[-1] + 1
+    return image[r_start:r_end, c_start:c_end].copy(), None
+
 
 def prune(
     image_path: str,
-    output_path: Optional[str] = None,
-    tolerance: int = BG_TOLERANCE,
-    min_gap: int = MIN_GAP,
-    gap_keep: int = GAP_KEEP,
-    save_debug: bool = False,
-    debug_dir: str = "debug_output",
-) -> dict:
-    """Main pruning function: full pipeline from screenshot to pruned image.
-
-    Takes a screenshot file path, detects content regions using
-    background-aware masking, collapses whitespace via projection
-    profiles, and returns reduction metrics plus a bidirectional
-    coordinate mapping.
-
-    This version:
-    - Estimates background color from image borders (not hardcoded white)
-    - Works on light AND dark themes
-    - Preserves spatial layout (no block collage)
-    - Never discards content regions regardless of size
-    - Returns a CoordinateMap with pruned_to_original / original_to_pruned
+    output_path=None,
+    tolerance=BG_TOLERANCE,
+    min_gap=MIN_GAP,
+    gap_keep=GAP_KEEP,
+    save_debug=False,
+    debug_dir="debug_output",
+    mode="compress",
+    count_tokens_fn=None,
+):
+    """Backward-compatible wrapper. Delegates to prune_image().
 
     Args:
         image_path: Path to the input screenshot PNG.
-        output_path: Where to save the pruned image. Defaults to
-            "<input_name>_pruned.png" in the same directory.
+        output_path: Where to save the pruned image.
         tolerance: Abs-diff threshold for content vs background.
         min_gap: Minimum empty-run length to collapse.
-        gap_keep: Collapsed gap is reduced to this many pixels.
-        save_debug: If True, save intermediate images to debug_dir.
+        gap_keep: Collapsed gap kept at this many pixels.
+        save_debug: If True, save intermediate images.
         debug_dir: Directory for debug images.
+        mode: One of "compress" (default), "repack", "legacy".
+        count_tokens_fn: Optional callable(pil_image) -> int for token counting.
 
     Returns:
-        Dictionary with:
-            "pruned_image": PIL Image object (the pruned result)
-            "output_path": str, where the pruned image was saved
-            "coord_map": CoordinateMap with bidirectional mapping
-            "metrics": dict with reduction statistics:
-                "original_pixels": int
-                "pruned_pixels": int
-                "pixel_reduction_pct": float
-                "original_file_kb": float
-                "pruned_file_kb": float
-                "file_reduction_pct": float
-                "original_dimensions": str
-                "pruned_dimensions": str
-                "ink_retention_pct": float
+        Same dict as prune_image().
     """
-    # Load
+    return prune_image(
+        image_path=image_path,
+        output_path=output_path,
+        mode=mode,
+        tolerance=tolerance,
+        min_gap=min_gap,
+        gap_keep=gap_keep,
+        save_debug=save_debug,
+        debug_dir=debug_dir,
+        count_tokens_fn=count_tokens_fn,
+    )
+
+
+def prune_image(
+    image_path: str,
+    output_path=None,
+    mode="compress",
+    tolerance=BG_TOLERANCE,
+    min_gap=MIN_GAP,
+    gap_keep=GAP_KEEP,
+    save_debug=False,
+    debug_dir="debug_output",
+    count_tokens_fn=None,
+) -> dict:
+    """Multi-mode pruning: compress, repack, or legacy.
+
+    Modes:
+      - "compress": gap-collapse preserving spatial layout. Returns CoordinateMap.
+      - "repack": tight vertical collage of content blocks. Returns RepackMap.
+      - "legacy": old global row/column crop (fixed grayscale). No coord map.
+
+    Args:
+        image_path: Path to the input screenshot PNG.
+        output_path: Where to save the pruned image.
+        mode: One of "compress", "repack", "legacy".
+        tolerance: Abs-diff threshold for content vs background.
+        min_gap: Minimum empty-run length to collapse.
+        gap_keep: Collapsed gap size in compress mode.
+        save_debug: If True, save intermediate images.
+        debug_dir: Directory for debug images.
+        count_tokens_fn: Optional callable(pil_image) -> int. When provided,
+            raw and pruned images are counted and token metrics are added.
+
+    Returns:
+        {
+            "pruned_image": PIL Image,
+            "output_path": str,
+            "coord_map": CoordinateMap | RepackMap | None,
+            "mode": str,
+            "metrics": dict,
+        }
+    """
+    valid_modes = ("compress", "repack", "legacy")
+    if mode not in valid_modes:
+        raise ValueError(f"mode must be one of {valid_modes}, got {mode!r}")
+
     image = cv2.imread(image_path)
     if image is None:
         raise FileNotFoundError(f"Could not load image: {image_path}")
@@ -457,61 +688,69 @@ def prune(
     h_orig, w_orig = image.shape[:2]
     original_file_kb = os.path.getsize(image_path) / 1024
 
-    # Step 1: Estimate background color from borders
-    bg_color = estimate_background_color(image)
-
-    # Step 2: Build content mask
-    content_mask = build_content_mask(image, bg_color, tolerance)
-
-    # Count content pixels in original (for ink retention metric)
-    original_ink_count = int(np.sum(content_mask > 0))
-
-    # Step 3: Compute projection profiles
-    row_profile, col_profile = compute_projection_profiles(content_mask)
-
-    # Step 4: Collapse whitespace
-    row_segments = _collapse_axis(row_profile, min_gap, gap_keep)
-    col_segments = _collapse_axis(col_profile, min_gap, gap_keep)
-
-    # Step 5: Reassemble pruned image
-    pruned_bgr = _apply_segments_to_image(image, row_segments, col_segments)
-
-    # Also apply segments to the content mask to count retained ink
-    pruned_mask = _apply_segments_to_image(content_mask, row_segments, col_segments)
-    pruned_ink_count = int(np.sum(pruned_mask > 0))
-
-    # Build coordinate map
-    h_pruned, w_pruned = pruned_bgr.shape[:2]
-    coord_map = CoordinateMap(
-        x_segments=col_segments,
-        y_segments=row_segments,
-        original_width=w_orig,
-        original_height=h_orig,
-        pruned_width=w_pruned,
-        pruned_height=h_pruned,
-    )
-
-    # Convert to PIL
-    pruned_rgb = cv2.cvtColor(pruned_bgr, cv2.COLOR_BGR2RGB)
-    pruned_image = Image.fromarray(pruned_rgb)
-
-    # Determine output path
     if output_path is None:
         base, ext = os.path.splitext(image_path)
-        output_path = f"{base}_pruned{ext}"
+        suffix = "_pruned" if mode == "compress" else f"_pruned_{mode}"
+        output_path = f"{base}{suffix}{ext}"
 
-    # Save pruned image
+    coord_map = None
+    content_mask = None
+
+    if mode == "legacy":
+        pruned_bgr, coord_map = _prune_legacy(image)
+    else:
+        bg_color = estimate_background_color(image)
+        content_mask = build_content_mask(image, bg_color, tolerance)
+        if mode == "compress":
+            row_profile, col_profile = compute_projection_profiles(content_mask)
+            row_segments = _collapse_axis(row_profile, min_gap, gap_keep)
+            col_segments = _collapse_axis(col_profile, min_gap, gap_keep)
+            pruned_bgr = _apply_segments_to_image(image, row_segments, col_segments)
+            hp, wp = pruned_bgr.shape[:2]
+            coord_map = CoordinateMap(
+                x_segments=col_segments,
+                y_segments=row_segments,
+                original_width=w_orig,
+                original_height=h_orig,
+                pruned_width=wp,
+                pruned_height=hp,
+            )
+        else:
+            pruned_bgr, coord_map = _prune_repack(image, content_mask, min_gap, gap_keep)
+
+    # Ink retention metric
+    original_ink_count = 0
+    pruned_ink_count = 0
+    if mode != "legacy" and content_mask is not None:
+        original_ink_count = int(np.sum(content_mask > 0))
+        if mode == "compress" and isinstance(coord_map, CoordinateMap):
+            pm = _apply_segments_to_image(content_mask, coord_map.y_segments, coord_map.x_segments)
+            pruned_ink_count = int(np.sum(pm > 0))
+        else:
+            pruned_ink_count = original_ink_count
+
+    pruned_rgb = cv2.cvtColor(pruned_bgr, cv2.COLOR_BGR2RGB)
+    pruned_image = Image.fromarray(pruned_rgb)
     pruned_image.save(output_path)
     pruned_file_kb = os.path.getsize(output_path) / 1024
+    h_pruned, w_pruned = pruned_bgr.shape[:2]
 
-    # Calculate metrics
     original_pixels = h_orig * w_orig
     pruned_pixels = w_pruned * h_pruned
     pixel_reduction = (1 - pruned_pixels / original_pixels) * 100 if original_pixels > 0 else 0
     file_reduction = (1 - pruned_file_kb / original_file_kb) * 100 if original_file_kb > 0 else 0
-    ink_retention = (pruned_ink_count / original_ink_count * 100) if original_ink_count > 0 else 100.0
+    ink_retention = pruned_ink_count / original_ink_count * 100 if original_ink_count > 0 else 100.0
 
-    metrics = {
+    num_content_blocks = 0
+    if mode == "repack" and hasattr(coord_map, "blocks"):
+        num_content_blocks = len(coord_map.blocks)
+    elif mode == "compress" and hasattr(coord_map, "y_segments"):
+        num_content_blocks = len(coord_map.y_segments)
+    elif mode == "legacy":
+        num_content_blocks = 1
+
+    metrics: dict = {
+        "mode": mode,
         "original_pixels": original_pixels,
         "pruned_pixels": pruned_pixels,
         "pixel_reduction_pct": round(pixel_reduction, 2),
@@ -523,29 +762,37 @@ def prune(
         "ink_retention_pct": round(ink_retention, 2),
         "original_ink_pixels": original_ink_count,
         "pruned_ink_pixels": pruned_ink_count,
+        "num_content_blocks": num_content_blocks,
     }
 
-    # Save debug images if requested
+    if count_tokens_fn is not None:
+        try:
+            raw_tokens = count_tokens_fn(Image.open(image_path).convert("RGB"))
+            pruned_tokens = count_tokens_fn(pruned_image)
+            token_reduction = (1 - pruned_tokens / raw_tokens) * 100 if raw_tokens > 0 else 0.0
+            metrics["raw_tokens"] = raw_tokens
+            metrics["pruned_tokens"] = pruned_tokens
+            metrics["token_reduction_pct"] = round(token_reduction, 2)
+        except Exception as e:
+            metrics["token_count_error"] = str(e)
+
     if save_debug:
         os.makedirs(debug_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(image_path))[0]
-
-        # Grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(os.path.join(debug_dir, f"{base_name}_grayscale.png"), gray)
-
-        # Content mask
-        cv2.imwrite(os.path.join(debug_dir, f"{base_name}_content_mask.png"), content_mask)
-
-        # Pruned image
-        cv2.imwrite(os.path.join(debug_dir, f"{base_name}_pruned_debug.png"), pruned_bgr)
+        if mode != "legacy" and content_mask is not None:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            cv2.imwrite(os.path.join(debug_dir, f"{base_name}_{mode}_grayscale.png"), gray)
+            cv2.imwrite(os.path.join(debug_dir, f"{base_name}_{mode}_content_mask.png"), content_mask)
+        cv2.imwrite(os.path.join(debug_dir, f"{base_name}_{mode}_pruned_debug.png"), pruned_bgr)
 
     return {
         "pruned_image": pruned_image,
         "output_path": output_path,
         "coord_map": coord_map,
+        "mode": mode,
         "metrics": metrics,
     }
+
 
 
 def log_metrics_csv(

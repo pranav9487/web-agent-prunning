@@ -98,7 +98,7 @@ def translate_coords(
 def click_element(
     x: int,
     y: int,
-    coord_map: Optional[dict] = None,
+    coord_map: Optional[Any] = None,
 ) -> str:
     """Click on a web page at specific pixel coordinates (x, y).
 
@@ -108,7 +108,7 @@ def click_element(
     Args:
         x: Horizontal pixel coordinate to click.
         y: Vertical pixel coordinate to click.
-        coord_map: Optional coordinate mapping dictionary from image pruning.
+        coord_map: Optional coordinate mapping dictionary or CoordinateMap from image pruning.
 
     Returns:
         Status message confirming the click or describing the failure.
@@ -135,7 +135,7 @@ def type_text(
     text: str,
     x: Optional[int] = None,
     y: Optional[int] = None,
-    coord_map: Optional[dict] = None,
+    coord_map: Optional[Any] = None,
 ) -> str:
     """Type text into an input field on the page.
 

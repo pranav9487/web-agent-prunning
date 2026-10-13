@@ -17,6 +17,7 @@ __pycache__/
 # Test outputs & screenshots
 test_screenshot.png
 screenshots/
+logs/
 *.png
 
 # Lock files
